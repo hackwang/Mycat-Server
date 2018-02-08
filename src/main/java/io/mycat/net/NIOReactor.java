@@ -32,14 +32,17 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import io.mycat.util.SelectorUtil;
-import org.slf4j.Logger; import org.slf4j.LoggerFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 网络事件反应器
  * 
  * <p>
- * Catch exceptions such as OOM so that the reactor can keep running for response client!
+ * Catch exceptions such as OOM so that the reactor can keep running for
+ * response client!
  * </p>
+ * 
  * @since 2016-03-30
  * 
  * @author mycat, Uncle-pan
@@ -60,6 +63,9 @@ public final class NIOReactor {
 	}
 
 	final void postRegister(AbstractConnection c) {
+		// 为什么放入RW线程的注册队列，而不是直接注册呢？如果是直接注册，那么就是NIOAcceptor这个线程负责注册，这里就会有锁竞争，
+		// 因为NIOAcceptor这个线程和每个RW线程会去竞争selector的锁。这样NIOAcceptor就不能高效的处理连接。
+		// 所以，更好的方式是将FrontendConnection放入RW线程的注册队列，之后让RW线程自己完成注册工作。
 		reactorR.registerQueue.offer(c);
 		reactorR.selector.wakeup();
 	}
@@ -74,6 +80,7 @@ public final class NIOReactor {
 
 	private final class RW implements Runnable {
 		private volatile Selector selector;
+		// 因为NIOAcceptor线程和RW线程这两个都会操作RW线程的注册队列，所以要用ConcurrentLinkedQueue
 		private final ConcurrentLinkedQueue<AbstractConnection> registerQueue;
 		private long reactCount;
 
@@ -93,14 +100,12 @@ public final class NIOReactor {
 					long start = System.nanoTime();
 					tSelector.select(500L);
 					long end = System.nanoTime();
+					// 从注册队列中取出AbstractConnection之后注册读事件
 					register(tSelector);
 					keys = tSelector.selectedKeys();
-					if (keys.size() == 0 && (end - start) < SelectorUtil.MIN_SELECT_TIME_IN_NANO_SECONDS )
-					{
+					if (keys.size() == 0 && (end - start) < SelectorUtil.MIN_SELECT_TIME_IN_NANO_SECONDS) {
 						invalidSelectCount++;
-					}
-					else
-					{
+					} else {
 						invalidSelectCount = 0;
 						for (SelectionKey key : keys) {
 							AbstractConnection con = null;
@@ -110,6 +115,7 @@ public final class NIOReactor {
 									con = (AbstractConnection) att;
 									if (key.isValid() && key.isReadable()) {
 										try {
+											// 异步读取数据并处理数据
 											con.asynRead();
 										} catch (IOException e) {
 											con.close("program err:" + e.toString());
@@ -121,6 +127,7 @@ public final class NIOReactor {
 										}
 									}
 									if (key.isValid() && key.isWritable()) {
+										// 异步写数据
 										con.doNextWriteCheck();
 									}
 								} else {
@@ -133,8 +140,9 @@ public final class NIOReactor {
 							} catch (Exception e) {
 								LOGGER.warn(con + " " + e);
 							} catch (final Throwable e) {
-								// Catch exceptions such as OOM and close connection if exists
-								//so that the reactor can keep running!
+								// Catch exceptions such as OOM and close
+								// connection if exists
+								// so that the reactor can keep running!
 								// @author Uncle-pan
 								// @since 2016-03-30
 								if (con != null) {
@@ -145,21 +153,20 @@ public final class NIOReactor {
 							}
 						}
 					}
-					if (invalidSelectCount > SelectorUtil.REBUILD_COUNT_THRESHOLD)
-					{
+					if (invalidSelectCount > SelectorUtil.REBUILD_COUNT_THRESHOLD) {
 						final Selector rebuildSelector = SelectorUtil.rebuildSelector(this.selector);
-						if (rebuildSelector != null)
-						{
+						if (rebuildSelector != null) {
 							this.selector = rebuildSelector;
 						}
 						invalidSelectCount = 0;
 					}
 				} catch (Exception e) {
 					LOGGER.warn(name, e);
-				} catch (final Throwable e){
-					// Catch exceptions such as OOM so that the reactor can keep running!
-                	// @author Uncle-pan
-                	// @since 2016-03-30
+				} catch (final Throwable e) {
+					// Catch exceptions such as OOM so that the reactor can keep
+					// running!
+					// @author Uncle-pan
+					// @since 2016-03-30
 					LOGGER.error("caught err: ", e);
 				} finally {
 					if (keys != null) {
@@ -177,7 +184,11 @@ public final class NIOReactor {
 			}
 			while ((c = registerQueue.poll()) != null) {
 				try {
+					// 注册读事件
 					((NIOSocketWR) c.getSocketWR()).register(selector);
+					// 连接注册，对于FrontendConnection是发送HandshakePacket并异步读取响应
+					// 响应为AuthPacket，读取其中的信息，验证用户名密码等信息，如果符合条件
+					// 则发送OkPacket
 					c.register();
 				} catch (Exception e) {
 					c.close("register err" + e.toString());

@@ -34,7 +34,8 @@ import java.nio.channels.SocketChannel;
 import java.util.Set;
 
 import io.mycat.util.SelectorUtil;
-import org.slf4j.Logger; import org.slf4j.LoggerFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import io.mycat.MycatServer;
 import io.mycat.net.factory.FrontendConnectionFactory;
@@ -42,7 +43,7 @@ import io.mycat.net.factory.FrontendConnectionFactory;
 /**
  * @author mycat
  */
-public final class NIOAcceptor extends Thread implements SocketAcceptor{
+public final class NIOAcceptor extends Thread implements SocketAcceptor {
 	private static final Logger LOGGER = LoggerFactory.getLogger(NIOAcceptor.class);
 	private static final AcceptIdGenerator ID_GENERATOR = new AcceptIdGenerator();
 
@@ -53,11 +54,11 @@ public final class NIOAcceptor extends Thread implements SocketAcceptor{
 	private long acceptCount;
 	private final NIOReactorPool reactorPool;
 
-	public NIOAcceptor(String name, String bindIp,int port, 
-			FrontendConnectionFactory factory, NIOReactorPool reactorPool)
-			throws IOException {
+	public NIOAcceptor(String name, String bindIp, int port, FrontendConnectionFactory factory,
+			NIOReactorPool reactorPool) throws IOException {
 		super.setName(name);
 		this.port = port;
+		// ServerSocketChannel配置，往selector上注册accept事件
 		this.selector = Selector.open();
 		this.serverChannel = ServerSocketChannel.open();
 		this.serverChannel.configureBlocking(false);
@@ -66,8 +67,11 @@ public final class NIOAcceptor extends Thread implements SocketAcceptor{
 		serverChannel.setOption(StandardSocketOptions.SO_RCVBUF, 1024 * 16 * 2);
 		// backlog=100
 		serverChannel.bind(new InetSocketAddress(bindIp, port), 100);
+		// 注册OP_ACCEPT，监听客户端连接
 		this.serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+		// FrontendConnectionFactory,用来封装channel成为FrontendConnection
 		this.factory = factory;
+		// NIOReactor池，封装请求为AbstractConnection
 		this.reactorPool = reactorPool;
 	}
 
@@ -87,18 +91,17 @@ public final class NIOAcceptor extends Thread implements SocketAcceptor{
 			++acceptCount;
 			try {
 				long start = System.nanoTime();
-			    tSelector.select(1000L);
+				// 轮询发现新连接请求
+				tSelector.select(1000L);
 				long end = System.nanoTime();
 				Set<SelectionKey> keys = tSelector.selectedKeys();
-				if (keys.size() == 0 && (end - start) < SelectorUtil.MIN_SELECT_TIME_IN_NANO_SECONDS )
-				{
+				if (keys.size() == 0 && (end - start) < SelectorUtil.MIN_SELECT_TIME_IN_NANO_SECONDS) {
 					invalidSelectCount++;
-				}
-				else
-                {
+				} else {
 					try {
 						for (SelectionKey key : keys) {
 							if (key.isValid() && key.isAcceptable()) {
+								// 接受连接操作
 								accept();
 							} else {
 								key.cancel();
@@ -109,11 +112,9 @@ public final class NIOAcceptor extends Thread implements SocketAcceptor{
 						invalidSelectCount = 0;
 					}
 				}
-				if (invalidSelectCount > SelectorUtil.REBUILD_COUNT_THRESHOLD)
-				{
+				if (invalidSelectCount > SelectorUtil.REBUILD_COUNT_THRESHOLD) {
 					final Selector rebuildSelector = SelectorUtil.rebuildSelector(this.selector);
-					if (rebuildSelector != null)
-					{
+					if (rebuildSelector != null) {
 						this.selector = rebuildSelector;
 					}
 					invalidSelectCount = 0;
@@ -128,19 +129,22 @@ public final class NIOAcceptor extends Thread implements SocketAcceptor{
 		SocketChannel channel = null;
 		try {
 			channel = serverChannel.accept();
+			// 得到通信channel并设置为非阻塞
 			channel.configureBlocking(false);
+			// 封装channel为FrontendConnection
 			FrontendConnection c = factory.make(channel);
 			c.setAccepted(true);
 			c.setId(ID_GENERATOR.getId());
-			NIOProcessor processor = (NIOProcessor) MycatServer.getInstance()
-					.nextProcessor();
+			// 利用NIOProcessor管理前端链接，定期清除空闲连接，同时做写队列检查
+			NIOProcessor processor = (NIOProcessor) MycatServer.getInstance().nextProcessor();
 			c.setProcessor(processor);
-			
+
+			// 和具体执行selector响应感兴趣事件的NIOReactor绑定
 			NIOReactor reactor = reactorPool.getNextReactor();
 			reactor.postRegister(c);
 
 		} catch (Exception e) {
-	        LOGGER.warn(getName(), e);
+			LOGGER.warn(getName(), e);
 			closeChannel(channel);
 		}
 	}
@@ -154,13 +158,13 @@ public final class NIOAcceptor extends Thread implements SocketAcceptor{
 			try {
 				socket.close();
 			} catch (IOException e) {
-		       LOGGER.error("closeChannelError", e);
+				LOGGER.error("closeChannelError", e);
 			}
 		}
 		try {
 			channel.close();
 		} catch (IOException e) {
-            LOGGER.error("closeChannelError", e);
+			LOGGER.error("closeChannelError", e);
 		}
 	}
 
