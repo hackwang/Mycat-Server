@@ -88,6 +88,7 @@ public abstract class FrontendConnection extends AbstractConnection {
 		this.host = remoteAddr.getHostString();
 		this.port = localAddr.getPort();
 		this.localPort = remoteAddr.getPort();
+		// 每个连接进来的第一次读处理都是验证AuthPacket，直接设置为FrontendAuthenticator
 		this.handler = new FrontendAuthenticator(this);
 	}
 
@@ -332,6 +333,7 @@ public abstract class FrontendConnection extends AbstractConnection {
 		String sql = null;
 		try {
 			MySQLMessage mm = new MySQLMessage(data);
+			// 从第六字节开始读取
 			mm.position(5);
 			sql = mm.readString(charset);
 		} catch (UnsupportedEncodingException e) {

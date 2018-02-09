@@ -113,6 +113,7 @@ public final class NIOReactor {
 								Object att = key.attachment();
 								if (att != null) {
 									con = (AbstractConnection) att;
+									// 监听到有效读
 									if (key.isValid() && key.isReadable()) {
 										try {
 											// 异步读取数据并处理数据

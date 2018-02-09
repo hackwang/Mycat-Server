@@ -320,13 +320,15 @@ public abstract class AbstractConnection implements NIOConnection {
 				}
 				break;
 			}
-
+			// 如果postion小于包起始位置加上包长度，证明readBuffer不够大，需要扩容
 			if (position >= offset + length && readBuffer != null) {
 
 				// handle this package
 				readBuffer.position(offset);
 				byte[] data = new byte[length];
+				// 读取一个完整的包
 				readBuffer.get(data, 0, length);
+				// 处理包，每种AbstractConnection的处理函数不同
 				handle(data);
 
 				// maybe handle stmt_close
@@ -334,10 +336,14 @@ public abstract class AbstractConnection implements NIOConnection {
 					return;
 				}
 
+				// 记录下读取到哪里了
 				// offset to next position
 				offset += length;
 
 				// reached end
+				// 如果最后写入位置等于最后读取位置，则证明所有的处理完了，可以清空缓存和offset
+				// 否则，记录下最新的offset
+				// 由于readBufferOffset只会单线程（绑定的RW线程）修改，但是会有多个线程访问（定时线程池的清理任务），所以设为volatile，不用CAS
 				if (position == offset) {
 					// if cur buffer is temper none direct byte buffer and not
 					// received large message in recent 30 seconds

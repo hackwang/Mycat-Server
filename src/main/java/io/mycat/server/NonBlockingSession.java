@@ -64,231 +64,238 @@ import io.mycat.server.sqlcmd.SQLCmdConstant;
  */
 public class NonBlockingSession implements Session {
 
-    public static final Logger LOGGER = LoggerFactory.getLogger(NonBlockingSession.class);
+	public static final Logger LOGGER = LoggerFactory.getLogger(NonBlockingSession.class);
 
-    private final ServerConnection source;
-    //huangyiming add 避免出现jdk版本冲突
-    private final ConcurrentMap<RouteResultsetNode, BackendConnection> target;
-    // life-cycle: each sql execution
-    private volatile SingleNodeHandler singleNodeHandler;
-    private volatile MultiNodeQueryHandler multiNodeHandler;
-    private volatile RollbackNodeHandler rollbackHandler;
-    private final MultiNodeCoordinator multiNodeCoordinator;
-    private final CommitNodeHandler commitHandler;
-    private volatile String xaTXID;
+	private final ServerConnection source;
+	// huangyiming add 避免出现jdk版本冲突
+	private final ConcurrentMap<RouteResultsetNode, BackendConnection> target;
+	// life-cycle: each sql execution
+	private volatile SingleNodeHandler singleNodeHandler;
+	private volatile MultiNodeQueryHandler multiNodeHandler;
+	private volatile RollbackNodeHandler rollbackHandler;
+	private final MultiNodeCoordinator multiNodeCoordinator;
+	private final CommitNodeHandler commitHandler;
+	private volatile String xaTXID;
 
-   //huangyiming 
-  	private  volatile boolean canClose = true;
-  	
-  	private volatile MiddlerResultHandler  middlerResultHandler;
-    private boolean prepared;
+	// huangyiming
+	private volatile boolean canClose = true;
 
-    public NonBlockingSession(ServerConnection source) {
-        this.source = source;
-        this.target = new ConcurrentHashMap<RouteResultsetNode, BackendConnection>(2, 0.75f);
-        multiNodeCoordinator = new MultiNodeCoordinator(this);
-        commitHandler = new CommitNodeHandler(this);
-    }
+	private volatile MiddlerResultHandler middlerResultHandler;
+	private boolean prepared;
 
-    @Override
-    public ServerConnection getSource() {
-        return source;
-    }
+	public NonBlockingSession(ServerConnection source) {
+		this.source = source;
+		this.target = new ConcurrentHashMap<RouteResultsetNode, BackendConnection>(2, 0.75f);
+		multiNodeCoordinator = new MultiNodeCoordinator(this);
+		commitHandler = new CommitNodeHandler(this);
+	}
 
-    @Override
-    public int getTargetCount() {
-        return target.size();
-    }
+	@Override
+	public ServerConnection getSource() {
+		return source;
+	}
 
-    public Set<RouteResultsetNode> getTargetKeys() {
-        return target.keySet();
-    }
+	@Override
+	public int getTargetCount() {
+		return target.size();
+	}
 
-    public BackendConnection getTarget(RouteResultsetNode key) {
-        return target.get(key);
-    }
+	public Set<RouteResultsetNode> getTargetKeys() {
+		return target.keySet();
+	}
 
-    public Map<RouteResultsetNode, BackendConnection> getTargetMap() {
-        return this.target;
-    }
+	public BackendConnection getTarget(RouteResultsetNode key) {
+		return target.get(key);
+	}
 
-    public BackendConnection removeTarget(RouteResultsetNode key) {
-        return target.remove(key);
-    }
-    
-    @Override
-    public void execute(RouteResultset rrs, int type) {
+	public Map<RouteResultsetNode, BackendConnection> getTargetMap() {
+		return this.target;
+	}
 
-        // clear prev execute resources
-        clearHandlesResources();
-        if (LOGGER.isDebugEnabled()) {
-            StringBuilder s = new StringBuilder();
-            LOGGER.debug(s.append(source).append(rrs).toString() + " rrs ");
-        }
+	public BackendConnection removeTarget(RouteResultsetNode key) {
+		return target.remove(key);
+	}
 
-        // 检查路由结果是否为空
-        RouteResultsetNode[] nodes = rrs.getNodes();
-        if (nodes == null || nodes.length == 0 || nodes[0].getName() == null || nodes[0].getName().equals("")) {
-            source.writeErrMessage(ErrorCode.ER_NO_DB_ERROR,
-                    "No dataNode found ,please check tables defined in schema:" + source.getSchema());
-            return;
-        }
-        boolean autocommit = source.isAutocommit();
-        final int initCount = target.size();
-        if (nodes.length == 1) {
-            singleNodeHandler = new SingleNodeHandler(rrs, this);
-            if (this.isPrepared()) {
-                singleNodeHandler.setPrepared(true);
-            }
+	@Override
+	public void execute(RouteResultset rrs, int type) {
 
-            try {
-                if(initCount > 1){
-                    checkDistriTransaxAndExecute(rrs,1,autocommit);
-                }else{
-                    singleNodeHandler.execute();
-                }
-            } catch (Exception e) {
-                LOGGER.warn(new StringBuilder().append(source).append(rrs).toString(), e);
-                source.writeErrMessage(ErrorCode.ERR_HANDLE_DATA, e.toString());
-            }
+		// clear prev execute resources
+		// 清理之前处理用的资源
+		clearHandlesResources();
+		if (LOGGER.isDebugEnabled()) {
+			StringBuilder s = new StringBuilder();
+			LOGGER.debug(s.append(source).append(rrs).toString() + " rrs ");
+		}
 
-        } else {
+		// 检查路由结果是否为空
+		RouteResultsetNode[] nodes = rrs.getNodes();
+		if (nodes == null || nodes.length == 0 || nodes[0].getName() == null || nodes[0].getName().equals("")) {
+			// 如果为空，则表名有误，提示客户端
+			source.writeErrMessage(ErrorCode.ER_NO_DB_ERROR,
+					"No dataNode found ,please check tables defined in schema:" + source.getSchema());
+			return;
+		}
+		boolean autocommit = source.isAutocommit();
+		final int initCount = target.size();
+		// 如果路由结果个数为1，则为单点查询或事务
+		if (nodes.length == 1) {
+			// 使用SingleNodeHandler处理单点查询或事务
+			singleNodeHandler = new SingleNodeHandler(rrs, this);
+			if (this.isPrepared()) {
+				singleNodeHandler.setPrepared(true);
+			}
 
-            multiNodeHandler = new MultiNodeQueryHandler(type, rrs, autocommit, this);
-            if (this.isPrepared()) {
-                multiNodeHandler.setPrepared(true);
-            }
-            try {
-                if(((type == ServerParse.DELETE || type == ServerParse.INSERT || type == ServerParse.UPDATE) && !rrs.isGlobalTable() && nodes.length > 1)||initCount > 1) {
-                    checkDistriTransaxAndExecute(rrs,2,autocommit);
-                } else {
-                    multiNodeHandler.execute();
-                }
-            } catch (Exception e) {
-                LOGGER.warn(new StringBuilder().append(source).append(rrs).toString(), e);
-                source.writeErrMessage(ErrorCode.ERR_HANDLE_DATA, e.toString());
-            }
-        }
+			try {
+				if (initCount > 1) {
+					// 如果目标路由大于1个，只往一台执行
+					checkDistriTransaxAndExecute(rrs, 1, autocommit);
+				} else {
+					singleNodeHandler.execute();
+				}
+			} catch (Exception e) {
+				LOGGER.warn(new StringBuilder().append(source).append(rrs).toString(), e);
+				source.writeErrMessage(ErrorCode.ERR_HANDLE_DATA, e.toString());
+			}
 
-        if (this.isPrepared()) {
-            this.setPrepared(false);
-        }
-    }
+		} else {
+			// 如果路由结果>1，则为多点查询或事务
+			// 使用multiNodeHandler处理多点查询或事务
+			multiNodeHandler = new MultiNodeQueryHandler(type, rrs, autocommit, this);
+			if (this.isPrepared()) {
+				multiNodeHandler.setPrepared(true);
+			}
+			try {
+				if (((type == ServerParse.DELETE || type == ServerParse.INSERT || type == ServerParse.UPDATE)
+						&& !rrs.isGlobalTable() && nodes.length > 1) || initCount > 1) {
+					checkDistriTransaxAndExecute(rrs, 2, autocommit);
+				} else {
+					multiNodeHandler.execute();
+				}
+			} catch (Exception e) {
+				LOGGER.warn(new StringBuilder().append(source).append(rrs).toString(), e);
+				source.writeErrMessage(ErrorCode.ERR_HANDLE_DATA, e.toString());
+			}
+		}
 
-    private void checkDistriTransaxAndExecute(RouteResultset rrs, int type,boolean autocommit) throws Exception {
-        switch(MycatServer.getInstance().getConfig().getSystem().getHandleDistributedTransactions()) {
-            case 1:
-                source.writeErrMessage(ErrorCode.ER_NOT_ALLOWED_COMMAND, "Distributed transaction is disabled!");
-                if(!autocommit){
-                    source.setTxInterrupt("Distributed transaction is disabled!");
-                }
-                break;
-            case 2:
-                LOGGER.warn("Distributed transaction detected! RRS:" + rrs);
-                if(type == 1){
-                    singleNodeHandler.execute();
-                }
-                else{
-                    multiNodeHandler.execute();
-                }
-                break;
-            default:
-                if(type == 1){
-                    singleNodeHandler.execute();
-                }
-                else{
-                    multiNodeHandler.execute();
-                }
-        }
-    }
+		if (this.isPrepared()) {
+			this.setPrepared(false);
+		}
+	}
 
-    private void checkDistriTransaxAndExecute() {
-        if(!isALLGlobal()){
-            switch(MycatServer.getInstance().getConfig().getSystem().getHandleDistributedTransactions()) {
-                case 1:
-                    source.writeErrMessage(ErrorCode.ER_NOT_ALLOWED_COMMAND, "Distributed transaction is disabled!Please rollback!");
-                    source.setTxInterrupt("Distributed transaction is disabled!");
-                    break;
-                case 2:
-                    multiNodeCoordinator.executeBatchNodeCmd(SQLCmdConstant.COMMIT_CMD);
-                    LOGGER.warn("Distributed transaction detected! Targets:" + target);
-                    break;
-                default:
-                    multiNodeCoordinator.executeBatchNodeCmd(SQLCmdConstant.COMMIT_CMD);
+	private void checkDistriTransaxAndExecute(RouteResultset rrs, int type, boolean autocommit) throws Exception {
+		// 判断是否分布式事务
+		switch (MycatServer.getInstance().getConfig().getSystem().getHandleDistributedTransactions()) {
+		case 1:
+			source.writeErrMessage(ErrorCode.ER_NOT_ALLOWED_COMMAND, "Distributed transaction is disabled!");
+			if (!autocommit) {
+				source.setTxInterrupt("Distributed transaction is disabled!");
+			}
+			break;
+		case 2:
+			LOGGER.warn("Distributed transaction detected! RRS:" + rrs);
+			if (type == 1) {
+				singleNodeHandler.execute();
+			} else {
+				multiNodeHandler.execute();
+			}
+			break;
+		default:
+			if (type == 1) {
+				singleNodeHandler.execute();
+			} else {
+				multiNodeHandler.execute();
+			}
+		}
+	}
 
-            }
-        } else {
-            multiNodeCoordinator.executeBatchNodeCmd(SQLCmdConstant.COMMIT_CMD);
-        }
-    }
+	private void checkDistriTransaxAndExecute() {
+		if (!isALLGlobal()) {
+			switch (MycatServer.getInstance().getConfig().getSystem().getHandleDistributedTransactions()) {
+			case 1:
+				source.writeErrMessage(ErrorCode.ER_NOT_ALLOWED_COMMAND,
+						"Distributed transaction is disabled!Please rollback!");
+				source.setTxInterrupt("Distributed transaction is disabled!");
+				break;
+			case 2:
+				multiNodeCoordinator.executeBatchNodeCmd(SQLCmdConstant.COMMIT_CMD);
+				LOGGER.warn("Distributed transaction detected! Targets:" + target);
+				break;
+			default:
+				multiNodeCoordinator.executeBatchNodeCmd(SQLCmdConstant.COMMIT_CMD);
 
-    public void commit() {
-        final int initCount = target.size();
-        if (initCount <= 0) {
-            ByteBuffer buffer = source.allocate();
-            buffer = source.writeToBuffer(OkPacket.OK, buffer);
-            source.write(buffer);
-            /* 1. 如果开启了 xa 事务 */
-            if(getXaTXID()!=null){
+			}
+		} else {
+			multiNodeCoordinator.executeBatchNodeCmd(SQLCmdConstant.COMMIT_CMD);
+		}
+	}
+
+	public void commit() {
+		final int initCount = target.size();
+		if (initCount <= 0) {
+			ByteBuffer buffer = source.allocate();
+			buffer = source.writeToBuffer(OkPacket.OK, buffer);
+			source.write(buffer);
+			/* 1. 如果开启了 xa 事务 */
+			if (getXaTXID() != null) {
 				setXATXEnabled(false);
 			}
-            /* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态    */
-            if(source.isPreAcStates()&&!source.isAutocommit()){
-            	source.setAutocommit(true);
-            }
-            return;
-        } else if (initCount == 1) {
-        	//huangyiming add 避免出现jdk版本冲突
-            BackendConnection con = target.values().iterator().next();
-            commitHandler.commit(con);
-        } else {
+			/* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态 */
+			if (source.isPreAcStates() && !source.isAutocommit()) {
+				source.setAutocommit(true);
+			}
+			return;
+		} else if (initCount == 1) {
+			// huangyiming add 避免出现jdk版本冲突
+			BackendConnection con = target.values().iterator().next();
+			commitHandler.commit(con);
+		} else {
 
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("multi node commit to send ,total " + initCount);
-            }
-            checkDistriTransaxAndExecute();
-        }
+			if (LOGGER.isDebugEnabled()) {
+				LOGGER.debug("multi node commit to send ,total " + initCount);
+			}
+			checkDistriTransaxAndExecute();
+		}
 
-    }
+	}
 
-    private boolean isALLGlobal(){
-        for(RouteResultsetNode routeResultsetNode:target.keySet()){
-            if(routeResultsetNode.getSource()==null){
-                return false;
-            }
-            else if(!routeResultsetNode.getSource().isGlobalTable()){
-                return false;
-            }
-        }
-        return true;
-    }
+	private boolean isALLGlobal() {
+		for (RouteResultsetNode routeResultsetNode : target.keySet()) {
+			if (routeResultsetNode.getSource() == null) {
+				return false;
+			} else if (!routeResultsetNode.getSource().isGlobalTable()) {
+				return false;
+			}
+		}
+		return true;
+	}
 
-    public void rollback() {
-        final int initCount = target.size();
-        if (initCount <= 0) {
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("no session bound connections found ,no need send rollback cmd ");
-            }
-            ByteBuffer buffer = source.allocate();
-            buffer = source.writeToBuffer(OkPacket.OK, buffer);
-            source.write(buffer);
-            /* 1. 如果开启了 xa 事务 */
-            if(getXaTXID()!=null){
+	public void rollback() {
+		final int initCount = target.size();
+		if (initCount <= 0) {
+			if (LOGGER.isDebugEnabled()) {
+				LOGGER.debug("no session bound connections found ,no need send rollback cmd ");
+			}
+			ByteBuffer buffer = source.allocate();
+			buffer = source.writeToBuffer(OkPacket.OK, buffer);
+			source.write(buffer);
+			/* 1. 如果开启了 xa 事务 */
+			if (getXaTXID() != null) {
 				setXATXEnabled(false);
 			}
-            /* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态    */
-            if(source.isPreAcStates()&&!source.isAutocommit()){
-            	source.setAutocommit(true);
-            }
-            return;
-        }
+			/* 2. preAcStates 为true,事务结束后,需要设置为true。preAcStates 为ac上一个状态 */
+			if (source.isPreAcStates() && !source.isAutocommit()) {
+				source.setAutocommit(true);
+			}
+			return;
+		}
 
-        rollbackHandler = new RollbackNodeHandler(this);
-        rollbackHandler.rollback();
-    }
+		rollbackHandler = new RollbackNodeHandler(this);
+		rollbackHandler.rollback();
+	}
 
 	/**
 	 * 执行lock tables语句方法
+	 * 
 	 * @author songdabin
 	 * @date 2016-7-9
 	 * @param rrs
@@ -296,11 +303,9 @@ public class NonBlockingSession implements Session {
 	public void lockTable(RouteResultset rrs) {
 		// 检查路由结果是否为空
 		RouteResultsetNode[] nodes = rrs.getNodes();
-		if (nodes == null || nodes.length == 0 || nodes[0].getName() == null
-				|| nodes[0].getName().equals("")) {
+		if (nodes == null || nodes.length == 0 || nodes[0].getName() == null || nodes[0].getName().equals("")) {
 			source.writeErrMessage(ErrorCode.ER_NO_DB_ERROR,
-					"No dataNode found ,please check tables defined in schema:"
-							+ source.getSchema());
+					"No dataNode found ,please check tables defined in schema:" + source.getSchema());
 			return;
 		}
 		LockTablesHandler handler = new LockTablesHandler(this, rrs);
@@ -315,6 +320,7 @@ public class NonBlockingSession implements Session {
 
 	/**
 	 * 执行unlock tables语句方法
+	 * 
 	 * @author songdabin
 	 * @date 2016-7-9
 	 * @param rrs
@@ -323,259 +329,246 @@ public class NonBlockingSession implements Session {
 		UnLockTablesHandler handler = new UnLockTablesHandler(this, this.source.isAutocommit(), sql);
 		handler.execute();
 	}
-	
-    @Override
-    public void cancel(FrontendConnection sponsor) {
 
-    }
+	@Override
+	public void cancel(FrontendConnection sponsor) {
 
-    /**
-     * {@link ServerConnection#isClosed()} must be true before invoking this
-     */
-    public void terminate() {
-        for (BackendConnection node : target.values()) {
-            node.close("client closed ");
-        }
-        target.clear();
-        clearHandlesResources();
-    }
+	}
 
-    public void closeAndClearResources(String reason) {
-        for (BackendConnection node : target.values()) {
-            node.close(reason);
-        }
-        target.clear();
-        clearHandlesResources();
-    }
+	/**
+	 * {@link ServerConnection#isClosed()} must be true before invoking this
+	 */
+	public void terminate() {
+		for (BackendConnection node : target.values()) {
+			node.close("client closed ");
+		}
+		target.clear();
+		clearHandlesResources();
+	}
 
-    public void releaseConnectionIfSafe(BackendConnection conn, boolean debug,
-                                        boolean needRollback) {
-        RouteResultsetNode node = (RouteResultsetNode) conn.getAttachment();
+	public void closeAndClearResources(String reason) {
+		for (BackendConnection node : target.values()) {
+			node.close(reason);
+		}
+		target.clear();
+		clearHandlesResources();
+	}
 
-        if (node != null) {
-            if (node.isDisctTable()) {
-                return;
-            }
-            if ((this.source.isAutocommit() || conn.isFromSlaveDB()
-                    || !conn.isModifiedSQLExecuted()) && !this.source.isLocked()) {
-                releaseConnection((RouteResultsetNode) conn.getAttachment(), LOGGER.isDebugEnabled(), needRollback);
-            }
-        }
-    }
+	public void releaseConnectionIfSafe(BackendConnection conn, boolean debug, boolean needRollback) {
+		RouteResultsetNode node = (RouteResultsetNode) conn.getAttachment();
 
-    public void releaseConnection(RouteResultsetNode rrn, boolean debug,
-                                  final boolean needRollback) {
+		if (node != null) {
+			if (node.isDisctTable()) {
+				return;
+			}
+			if ((this.source.isAutocommit() || conn.isFromSlaveDB() || !conn.isModifiedSQLExecuted())
+					&& !this.source.isLocked()) {
+				releaseConnection((RouteResultsetNode) conn.getAttachment(), LOGGER.isDebugEnabled(), needRollback);
+			}
+		}
+	}
 
-        BackendConnection c = target.remove(rrn);
-        if (c != null) {
-            if (debug) {
-                LOGGER.debug("release connection " + c);
-            }
-            if (c.getAttachment() != null) {
-                c.setAttachment(null);
-            }
-            if (!c.isClosedOrQuit()) {
-                if (c.isAutocommit()) {
-                    c.release();
-                } else
-                //if (needRollback)
-                {
-                    c.setResponseHandler(new RollbackReleaseHandler());
-                    c.rollback();
-                }
-                //else {
-				//	c.release();
-				//}
-            }
-        }
-    }
+	public void releaseConnection(RouteResultsetNode rrn, boolean debug, final boolean needRollback) {
 
-    public void releaseConnections(final boolean needRollback) {
-        boolean debug = LOGGER.isDebugEnabled();
-        
-        for (RouteResultsetNode rrn : target.keySet()) {
-            releaseConnection(rrn, debug, needRollback);
-        }
-    }
+		BackendConnection c = target.remove(rrn);
+		if (c != null) {
+			if (debug) {
+				LOGGER.debug("release connection " + c);
+			}
+			if (c.getAttachment() != null) {
+				c.setAttachment(null);
+			}
+			if (!c.isClosedOrQuit()) {
+				if (c.isAutocommit()) {
+					c.release();
+				} else
+				// if (needRollback)
+				{
+					c.setResponseHandler(new RollbackReleaseHandler());
+					c.rollback();
+				}
+				// else {
+				// c.release();
+				// }
+			}
+		}
+	}
 
-    public void releaseConnection(BackendConnection con) {
-        Iterator<Entry<RouteResultsetNode, BackendConnection>> itor = target
-                .entrySet().iterator();
-        while (itor.hasNext()) {
-            BackendConnection theCon = itor.next().getValue();
-            if (theCon == con) {
-                itor.remove();
-                con.release();
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("realse connection " + con);
-                }
-                break;
-            }
-        }
+	public void releaseConnections(final boolean needRollback) {
+		boolean debug = LOGGER.isDebugEnabled();
 
-    }
+		for (RouteResultsetNode rrn : target.keySet()) {
+			releaseConnection(rrn, debug, needRollback);
+		}
+	}
 
-    /**
-     * @return previous bound connection
-     */
-    public BackendConnection bindConnection(RouteResultsetNode key,
-                                            BackendConnection conn) {
-        // System.out.println("bind connection "+conn+
-        // " to key "+key.getName()+" on sesion "+this);
-        return target.put(key, conn);
-    }
-    
-    public boolean tryExistsCon(final BackendConnection conn, RouteResultsetNode node) {
-        if (conn == null) {
-            return false;
-        }
+	public void releaseConnection(BackendConnection con) {
+		Iterator<Entry<RouteResultsetNode, BackendConnection>> itor = target.entrySet().iterator();
+		while (itor.hasNext()) {
+			BackendConnection theCon = itor.next().getValue();
+			if (theCon == con) {
+				itor.remove();
+				con.release();
+				if (LOGGER.isDebugEnabled()) {
+					LOGGER.debug("realse connection " + con);
+				}
+				break;
+			}
+		}
 
-        boolean canReUse = false;
-        // conn 是 slave db 的，并且 路由结果显示，本次sql可以重用该 conn
-        if (conn.isFromSlaveDB() && (node.canRunnINReadDB(getSource().isAutocommit())
-                && (node.getRunOnSlave() == null || node.getRunOnSlave()))) {
-            canReUse = true;
-        }
+	}
 
-        // conn 是 master db 的，并且路由结果显示，本次sql可以重用该conn
-        if (!conn.isFromSlaveDB() && (node.getRunOnSlave() == null || !node.getRunOnSlave())) {
-            canReUse = true;
-        }
+	/**
+	 * @return previous bound connection
+	 */
+	public BackendConnection bindConnection(RouteResultsetNode key, BackendConnection conn) {
+		// System.out.println("bind connection "+conn+
+		// " to key "+key.getName()+" on sesion "+this);
+		return target.put(key, conn);
+	}
 
-        if (canReUse) {
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("found connections in session to use " + conn
-                        + " for " + node);
-            }
-            conn.setAttachment(node);
-            return true;
-        } else {
-            // slavedb connection and can't use anymore ,release it
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("release slave connection,can't be used in trasaction  "
-                        + conn + " for " + node);
-            }
-            releaseConnection(node, LOGGER.isDebugEnabled(), false);
-        }
-        return false;
-    }
+	public boolean tryExistsCon(final BackendConnection conn, RouteResultsetNode node) {
+		if (conn == null) {
+			return false;
+		}
 
-//	public boolean tryExistsCon(final BackendConnection conn,
-//			RouteResultsetNode node) {
-//
-//		if (conn == null) {
-//			return false;
-//		}
-//		if (!conn.isFromSlaveDB()
-//				|| node.canRunnINReadDB(getSource().isAutocommit())) {
-//			if (LOGGER.isDebugEnabled()) {
-//				LOGGER.debug("found connections in session to use " + conn
-//						+ " for " + node);
-//			}
-//			conn.setAttachment(node);
-//			return true;
-//		} else {
-//			// slavedb connection and can't use anymore ,release it
-//			if (LOGGER.isDebugEnabled()) {
-//				LOGGER.debug("release slave connection,can't be used in trasaction  "
-//						+ conn + " for " + node);
-//			}
-//			releaseConnection(node, LOGGER.isDebugEnabled(), false);
-//		}
-//		return false;
-//	}
+		boolean canReUse = false;
+		// conn 是 slave db 的，并且 路由结果显示，本次sql可以重用该 conn
+		if (conn.isFromSlaveDB() && (node.canRunnINReadDB(getSource().isAutocommit())
+				&& (node.getRunOnSlave() == null || node.getRunOnSlave()))) {
+			canReUse = true;
+		}
 
-    protected void kill() {
-        boolean hooked = false;
-        AtomicInteger count = null;
-        Map<RouteResultsetNode, BackendConnection> killees = null;
-        for (RouteResultsetNode node : target.keySet()) {
-            BackendConnection c = target.get(node);
-            if (c != null) {
-                if (!hooked) {
-                    hooked = true;
-                    killees = new HashMap<RouteResultsetNode, BackendConnection>();
-                    count = new AtomicInteger(0);
-                }
-                killees.put(node, c);
-                count.incrementAndGet();
-            }
-        }
-        if (hooked) {
-            for (Entry<RouteResultsetNode, BackendConnection> en : killees
-                    .entrySet()) {
-                KillConnectionHandler kill = new KillConnectionHandler(
-                        en.getValue(), this);
-                MycatConfig conf = MycatServer.getInstance().getConfig();
-                PhysicalDBNode dn = conf.getDataNodes().get(
-                        en.getKey().getName());
-                try {
-                    dn.getConnectionFromSameSource(null, true, en.getValue(),
-                            kill, en.getKey());
-                } catch (Exception e) {
-                    LOGGER.error(
-                            "get killer connection failed for " + en.getKey(),
-                            e);
-                    kill.connectionError(e, null);
-                }
-            }
-        }
-    }
+		// conn 是 master db 的，并且路由结果显示，本次sql可以重用该conn
+		if (!conn.isFromSlaveDB() && (node.getRunOnSlave() == null || !node.getRunOnSlave())) {
+			canReUse = true;
+		}
 
-    private void clearHandlesResources() {
-        SingleNodeHandler singleHander = singleNodeHandler;
-        if (singleHander != null) {
-            singleHander.clearResources();
-            singleNodeHandler = null;
-        }
-        MultiNodeQueryHandler multiHandler = multiNodeHandler;
-        if (multiHandler != null) {
-            multiHandler.clearResources();
-            multiNodeHandler = null;
-        }
-    }
+		if (canReUse) {
+			if (LOGGER.isDebugEnabled()) {
+				LOGGER.debug("found connections in session to use " + conn + " for " + node);
+			}
+			conn.setAttachment(node);
+			return true;
+		} else {
+			// slavedb connection and can't use anymore ,release it
+			if (LOGGER.isDebugEnabled()) {
+				LOGGER.debug("release slave connection,can't be used in trasaction  " + conn + " for " + node);
+			}
+			releaseConnection(node, LOGGER.isDebugEnabled(), false);
+		}
+		return false;
+	}
 
-    public void clearResources(final boolean needRollback) {
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("clear session resources " + this);
-        }
-        this.releaseConnections(needRollback);
-        clearHandlesResources();
-    }
+	// public boolean tryExistsCon(final BackendConnection conn,
+	// RouteResultsetNode node) {
+	//
+	// if (conn == null) {
+	// return false;
+	// }
+	// if (!conn.isFromSlaveDB()
+	// || node.canRunnINReadDB(getSource().isAutocommit())) {
+	// if (LOGGER.isDebugEnabled()) {
+	// LOGGER.debug("found connections in session to use " + conn
+	// + " for " + node);
+	// }
+	// conn.setAttachment(node);
+	// return true;
+	// } else {
+	// // slavedb connection and can't use anymore ,release it
+	// if (LOGGER.isDebugEnabled()) {
+	// LOGGER.debug("release slave connection,can't be used in trasaction "
+	// + conn + " for " + node);
+	// }
+	// releaseConnection(node, LOGGER.isDebugEnabled(), false);
+	// }
+	// return false;
+	// }
 
-    public boolean closed() {
-        return source.isClosed();
-    }
+	protected void kill() {
+		boolean hooked = false;
+		AtomicInteger count = null;
+		Map<RouteResultsetNode, BackendConnection> killees = null;
+		for (RouteResultsetNode node : target.keySet()) {
+			BackendConnection c = target.get(node);
+			if (c != null) {
+				if (!hooked) {
+					hooked = true;
+					killees = new HashMap<RouteResultsetNode, BackendConnection>();
+					count = new AtomicInteger(0);
+				}
+				killees.put(node, c);
+				count.incrementAndGet();
+			}
+		}
+		if (hooked) {
+			for (Entry<RouteResultsetNode, BackendConnection> en : killees.entrySet()) {
+				KillConnectionHandler kill = new KillConnectionHandler(en.getValue(), this);
+				MycatConfig conf = MycatServer.getInstance().getConfig();
+				PhysicalDBNode dn = conf.getDataNodes().get(en.getKey().getName());
+				try {
+					dn.getConnectionFromSameSource(null, true, en.getValue(), kill, en.getKey());
+				} catch (Exception e) {
+					LOGGER.error("get killer connection failed for " + en.getKey(), e);
+					kill.connectionError(e, null);
+				}
+			}
+		}
+	}
 
-    private String genXATXID() {
-        return MycatServer.getInstance().getXATXIDGLOBAL();
-    }
+	private void clearHandlesResources() {
+		SingleNodeHandler singleHander = singleNodeHandler;
+		if (singleHander != null) {
+			singleHander.clearResources();
+			singleNodeHandler = null;
+		}
+		MultiNodeQueryHandler multiHandler = multiNodeHandler;
+		if (multiHandler != null) {
+			multiHandler.clearResources();
+			multiNodeHandler = null;
+		}
+	}
 
-    public void setXATXEnabled(boolean xaTXEnabled) {
+	public void clearResources(final boolean needRollback) {
+		if (LOGGER.isDebugEnabled()) {
+			LOGGER.debug("clear session resources " + this);
+		}
+		this.releaseConnections(needRollback);
+		clearHandlesResources();
+	}
 
-        if (xaTXEnabled) {
-        	LOGGER.info("XA Transaction enabled ,con " + this.getSource());
-        	if(this.xaTXID == null){
-        		xaTXID = genXATXID();
-        	}
-        }else{
-        	LOGGER.info("XA Transaction disabled ,con " + this.getSource());
-        	this.xaTXID = null;
-        }
-    }
+	public boolean closed() {
+		return source.isClosed();
+	}
 
-    public String getXaTXID() {
-        return xaTXID;
-    }
+	private String genXATXID() {
+		return MycatServer.getInstance().getXATXIDGLOBAL();
+	}
 
-    public boolean isPrepared() {
-        return prepared;
-    }
+	public void setXATXEnabled(boolean xaTXEnabled) {
 
-    public void setPrepared(boolean prepared) {
-        this.prepared = prepared;
-    }
+		if (xaTXEnabled) {
+			LOGGER.info("XA Transaction enabled ,con " + this.getSource());
+			if (this.xaTXID == null) {
+				xaTXID = genXATXID();
+			}
+		} else {
+			LOGGER.info("XA Transaction disabled ,con " + this.getSource());
+			this.xaTXID = null;
+		}
+	}
 
+	public String getXaTXID() {
+		return xaTXID;
+	}
+
+	public boolean isPrepared() {
+		return prepared;
+	}
+
+	public void setPrepared(boolean prepared) {
+		this.prepared = prepared;
+	}
 
 	public boolean isCanClose() {
 		return canClose;
@@ -593,5 +586,4 @@ public class NonBlockingSession implements Session {
 		this.middlerResultHandler = middlerResultHandler;
 	}
 
-    
 }
